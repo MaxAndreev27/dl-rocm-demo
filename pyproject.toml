@@ -1,0 +1,36 @@
+[project]
+name = "dl-rocm-demo"
+version = "0.1.0"
+description = "Local ROCm 10.2 / gfx1103 (Radeon 780M) PyTorch demo — no system-wide ROCm"
+readme = "README.md"
+authors = [
+    { name = "max", email = "maxandreev27@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "torch[device-gfx1103]==2.14.0+rocm10.2.0",
+    "torchvision==0.29.0+rocm10.2.0",
+]
+
+[project.scripts]
+dl-rocm-demo = "dl_rocm_demo:main"
+
+[[tool.uv.index]]
+url = "https://stable.repo.amd.com/rocm/core/whl-next/"
+
+[build-system]
+requires = ["uv_build>=0.13.9,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+# The torch build exists only on the AMD indexes; the remaining dependencies
+# come from PyPI. "unsafe-best-match" lets uv search all configured indexes.
+index-strategy = "unsafe-best-match"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.4.0",
+]
+
+[[tool.uv.index]]
+url = "https://stable.repo.amd.com/rocm/pytorch/whl-next/"
