@@ -16,6 +16,7 @@ import sys
 import time
 
 import torch
+import torch.nn.functional as F
 
 N = 4096  # Matrix size for the matmul benchmark.
 
@@ -23,6 +24,48 @@ N = 4096  # Matrix size for the matmul benchmark.
 def sync(device: str) -> None:
     if device == "cuda":
         torch.cuda.synchronize()
+
+
+def bench_conv2d(
+    device: str,
+    dtype: torch.dtype,
+    batch_size: int = 16,
+    image_size: int = 128,
+    in_channels: int = 3,
+    out_channels: int = 32,
+    kernel_size: int = 3,
+    iters: int = 20,
+    warmup: int = 5,
+) -> tuple[float, float]:
+    """Return seconds per forward pass and GFLOPS for a Conv2D."""
+    x = torch.randn(
+        batch_size, in_channels, image_size, image_size, device=device, dtype=dtype
+    )
+    weight = torch.randn(
+        out_channels, in_channels, kernel_size, kernel_size, device=device, dtype=dtype
+    )
+    if device == "cuda":
+        x = x.to(memory_format=torch.channels_last)
+        weight = weight.to(memory_format=torch.channels_last)
+        torch.backends.cudnn.benchmark = True
+
+    for _ in range(warmup):
+        F.conv2d(x, weight, padding=kernel_size // 2)
+    sync(device)
+
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        F.conv2d(x, weight, padding=kernel_size // 2)
+    sync(device)
+
+    dt = (time.perf_counter() - t0) / iters
+    output_size = image_size + 2 * (kernel_size // 2) - kernel_size + 1
+    flops = 2 * batch_size * output_size**2 * out_channels * in_channels * kernel_size**2
+    gflops = flops / dt / 1e9
+    del x, weight
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    return dt, gflops
 
 
 def bench_matmul(
@@ -108,7 +151,20 @@ def main() -> int:
     print(f"matmul sanity: {sanity:.4f}  (ok)")
 
     print("\n" + line)
-    print(f"Matmul {N}x{N}, FP16/BF16 (higher GFLOPS is better)")
+    print("Test 1: Conv2D forward, 16x3x128x128 -> 32 channels, 3x3")
+    print(line)
+    conv_rows = [
+        ("CPU fp32", *bench_conv2d("cpu", torch.float32)),
+        ("GPU fp16", *bench_conv2d("cuda", torch.float16)),
+    ]
+    for name, dt, gflops in conv_rows:
+        print(f"{name:<10} {dt * 1e3:9.2f} ms   {gflops:9.1f} GFLOPS")
+    cpu_conv = next(g for n, _, g in conv_rows if n == "CPU fp32")
+    gpu_conv = next(g for n, _, g in conv_rows if n == "GPU fp16")
+    print(f"GPU fp16 speedup vs CPU fp32: x{gpu_conv / cpu_conv:.2f}")
+
+    print("\n" + line)
+    print(f"Test 2: Matmul {N}x{N}, FP16/BF16 (higher GFLOPS is better)")
     print(line)
     rows: list[tuple[str, float, float]] = []
     rows.append(("CPU fp32", *bench_matmul("cpu", torch.float32)))

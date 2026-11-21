@@ -52,11 +52,15 @@ The following measurements were recorded on a Radeon 780M (`gfx1103`):
 | 4096x4096 matmul, CPU fp32 | ~0.76–0.80 TFLOPS |
 | 4096x4096 matmul, CPU bf16 | ~1.6–1.7 TFLOPS |
 | 4096x4096 matmul, GPU fp16 | ~4.7–6.6 TFLOPS (varies with power and clock speeds) |
+| Conv2D `16x3x128x128` → 32 channels, CPU fp32 | ~42 GFLOPS |
+| Conv2D `16x3x128x128` → 32 channels, GPU fp16 | ~576 GFLOPS (~13.5x vs CPU fp32) |
 | 256 MiB copy, CPU | ~41 GB/s |
 | 256 MiB copy, GPU (GTT) | ~75–77 GB/s |
 | Small CNN training | CPU 0.87 s/epoch, GPU 0.38 s/epoch (~2.3x) |
 
 Results depend on power limits, cooling, and background load. On an APU, the GPU can be much faster for large matrix multiplications and convolutions, while small models may see a smaller improvement or run faster on the CPU.
+
+`check_gpu.py` also runs **Test 1: Conv2D** (forward pass, CPU fp32 vs GPU fp16) and reports latency, GFLOPS, and speedup. The interactive notebook contains the same standalone convolution benchmark.
 
 ## Notes and troubleshooting
 
