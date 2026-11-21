@@ -20,7 +20,7 @@ The pinned ROCm and PyTorch wheels target AMD GPU hardware. CPU-only machines ca
 
 - Keep user-facing documentation, comments, and command output in English.
 - Preserve the existing formatting and keep changes focused.
-- For Python changes, run `uv run python -m compileall check_gpu.py train_demo.py src`.
+- For Python changes, run `uv run python -m compileall *.py src tests` and `uv run python -m unittest discover -s tests -v`.
 - When compatible AMD GPU hardware is available, run `uv run python check_gpu.py` and `uv run python train_demo.py --epochs 1`.
 - For notebook changes, verify that the notebook remains valid JSON and that modified code cells are syntactically valid.
 

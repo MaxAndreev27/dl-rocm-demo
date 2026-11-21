@@ -6,7 +6,7 @@ A local PyTorch and ROCm 10.2 demo for the Radeon 780M (`gfx1103`), without a sy
 
 The project keeps the ROCm runtime and PyTorch in its local `.venv`:
 
-- `.venv/` contains Python 3.13, `torch 2.14.0+rocm10.2.0`, `torchvision 0.29.0+rocm10.2.0`, and the `rocm-sdk-*` runtime packages.
+- `.venv/` uses Python 3.13 and contains `torch 2.14.0+rocm10.2.0`, `torchvision 0.29.0+rocm10.2.0`, and the `rocm-sdk-*` runtime packages. Its Python executable may link to an interpreter outside the project.
 - `/opt/rocm` is not used or installed.
 - The system uses the standard `amdgpu` kernel driver.
 
@@ -23,7 +23,7 @@ The pinned ROCm/PyTorch versions target this specific setup and may not work on 
 ## Setup and usage
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/MaxAndreev27/dl-rocm-demo.git
 cd dl-rocm-demo
 uv sync
 
@@ -50,8 +50,8 @@ uv run python sentence_transformers_demo.py --query "How do I find related text?
 # Actual duration varies with GPU clocks, thermals, and background load.
 timeout 30m uv run python train_demo.py --long-test
 
-# Start JupyterLab, if installed in the environment.
-uv run jupyter lab
+# Start JupyterLab with an additional temporary dependency.
+uv run --with jupyterlab jupyter lab
 ```
 
 Alternatively, open `demo.ipynb` in VS Code or Cursor and select `.venv/bin/python` as the notebook kernel.
@@ -66,7 +66,7 @@ Test 3 trains the GPU for 100 epochs by default (select 20–100 with `--long-te
 
 `computer_vision_demo.py` trains ResNet18 and MobileNetV3-Small from scratch on synthetic class-pattern images, then reports test loss, accuracy, training time, and inference latency. It uses FP32 on both CPU and GPU to avoid the FP16 MIOpen convolution failure observed with the tested `gfx1103` stack. This small smoke test does not download a dataset or pretrained weights; increase `--train-size`, `--test-size`, or `--epochs` for a longer run.
 
-`large_model_stress.py` now uses ResNet18 in FP32, defaulting to CPU with batch 4, 64×64 synthetic images, one warm-up step and six seconds of training. For GPU use, explicitly select `--device cuda`. The GPU path reports throughput, PyTorch peak allocated/reserved memory, the maximum **sampled** reduction in global free GPU memory, and whether kernel-log fault checks are available. An optional `--target-gtt-gib 2` requires a sampled reduction of at least 2 GiB and otherwise exits nonzero; the default run does not claim to reach 2–4 GiB. Free-memory readings can include other GPU processes, and measurements between steps miss transient peaks.
+`large_model_stress.py` now uses ResNet18 in FP32, defaulting to CPU with batch 4, 256×256 synthetic images, one warm-up step and six seconds of training. For GPU use, explicitly select `--device cuda`. The GPU path reports throughput, PyTorch peak allocated/reserved memory, the maximum **sampled** reduction in global free GPU memory, and whether kernel-log fault checks are available. An optional `--target-gtt-gib 2` requires a sampled reduction of at least 2 GiB and otherwise exits nonzero; the default run does not claim to reach 2–4 GiB. Free-memory readings can include other GPU processes, and measurements between steps miss transient peaks.
 
 The previous ResNet50 GPU test caused a MIOpen/HIP launch failure and the system hung; the cause remains unknown. **A smaller ResNet18 workload is not guaranteed safe**, even though a single step previously succeeded. Save your work before opting into GPU use. Memory checks between steps cannot prevent a GPU hang, an out-of-memory condition, or transient peaks during a step; a timeout cannot guarantee recovery.
 
@@ -116,6 +116,8 @@ Results depend on power limits, cooling, and background load. On an APU, the GPU
 ## Reproducible environment
 
 Run `uv sync` to create the environment. AMD package indexes and the resolver strategy are configured in `pyproject.toml`; package versions are pinned in `uv.lock`. Add standard packages with `uv add`, for example `uv add pandas`.
+
+The environment is stored in `.venv/`, but uv's package cache and managed Python installations are outside the project by default, under `~/.cache/uv/` and `~/.local/share/uv/python/` on Linux. Hugging Face model downloads normally go to `~/.cache/huggingface/`, and MIOpen may write a cache under `~/.cache/miopen/`. These locations can be configured and may be shared with other projects. Clearing caches can require downloads or compilation on the next run. Removing `.venv/` removes the project environment; `uv sync` recreates it using the configured Python and package sources.
 
 ## Contributing
 
