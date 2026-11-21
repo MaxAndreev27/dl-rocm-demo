@@ -34,6 +34,10 @@ uv run python check_gpu.py
 uv run python train_demo.py
 uv run python train_demo.py --epochs 3 --device cuda
 
+# Load a small Hugging Face model, tokenize a prompt, and generate text.
+uv run python transformers_demo.py
+uv run python transformers_demo.py --prompt "The future of AI is" --max-new-tokens 40
+
 # Run Test 3: 100 epochs, about 2.5 minutes on the tested Radeon 780M.
 # Actual duration varies with GPU clocks, thermals, and background load.
 timeout 30m uv run python train_demo.py --long-test
@@ -44,9 +48,11 @@ uv run jupyter lab
 
 Alternatively, open `demo.ipynb` in VS Code or Cursor and select `.venv/bin/python` as the notebook kernel.
 
-Command-line runs also display and save their output in `benchmark_results/` in the project directory. `check_gpu.py` writes a complete `check_gpu.txt` log and separate files for environment information, Conv2D, Transformer, matmul, memory copy, and GPU memory; `train_demo.py` writes `training.txt` or `long_test.txt` depending on the mode. Each file is overwritten when that test starts again, while results of other tests remain unchanged. Standard output and errors are read independently, so warnings near a section boundary may appear in an adjacent section; consult the complete log for all output. Output is flushed line by line, so an interrupted run may leave partial results. The directory is ignored by Git. Notebook cells do not use this command-line logging.
+Command-line runs also display and save their output in `benchmark_results/` in the project directory. `check_gpu.py` writes a complete `check_gpu.txt` log and separate files for environment information, Conv2D, Transformer, matmul, memory copy, and GPU memory; `train_demo.py` writes `training.txt` or `long_test.txt` depending on the mode; `transformers_demo.py` writes `transformers.txt`. Each file is overwritten when that test starts again, while results of other tests remain unchanged. Standard output and errors are read independently, so warnings near a section boundary may appear in an adjacent section; consult the complete log for all output. Output is flushed line by line, so an interrupted run may leave partial results. The directory is ignored by Git. Notebook cells do not use this command-line logging.
 
 Test 3 trains the GPU for 100 epochs by default (select 20–100 with `--long-test-epochs`). On the tested Radeon 780M, the estimate is about 2.5 minutes, extrapolated from the measured 25-epoch run; actual duration varies with GPU clocks, thermals, and background load. It samples temperature, GPU clock, RAM, and GPU memory several times during each epoch and reports the observed peak temperatures/clock plus epoch speed. Each epoch synchronizes with the GPU, so a completed run confirms all epochs finished. New AMD GPU fault/reset messages are checked in `dmesg`; if kernel-log access is restricted, the test reports that check as unavailable rather than claiming no faults occurred. `timeout` provides a process-level guard against a hung run.
+
+`transformers_demo.py` downloads the default `distilgpt2` model from Hugging Face on its first run (internet access is required); later runs use the local model cache. It automatically uses the ROCm GPU when available, or CPU otherwise. Use `--device cpu` or `--device cuda` to select a device explicitly, or `--model MODEL_ID` to test another compatible causal language model.
 
 ## Example results
 
