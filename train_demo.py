@@ -15,13 +15,21 @@ from __future__ import annotations
 
 import argparse
 import copy
+import os
 import re
 import subprocess
+import sys
 import time
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+from benchmark_logs import CHILD_ENV, run_logged
+
+if __name__ == "__main__" and os.environ.get(CHILD_ENV) != "1":
+    log_file = "long_test.txt" if "--long-test" in sys.argv[1:] else "training.txt"
+    raise SystemExit(run_logged(Path(__file__), sys.argv[1:], log_file))
 
 import torch
 import torch.nn.functional as F

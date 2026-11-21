@@ -14,6 +14,27 @@ import os
 import platform
 import sys
 import time
+from pathlib import Path
+
+from benchmark_logs import CHILD_ENV, run_logged
+
+if __name__ == "__main__" and os.environ.get(CHILD_ENV) != "1":
+    sys.exit(
+        run_logged(
+            Path(__file__),
+            sys.argv[1:],
+            "gpu_environment.txt",
+            {
+                "Test 1: Conv2D": "conv2d.txt",
+                "Test 2: Transformer operations": "transformer.txt",
+                "Test 3 (long-run stability)": "long_test_instructions.txt",
+                "Test 4: Matmul": "matmul.txt",
+                "Copying 256 MiB": "memory_copy.txt",
+                "GPU memory": "gpu_memory.txt",
+            },
+            full_file="check_gpu.txt",
+        )
+    )
 
 import torch
 import torch.nn.functional as F
