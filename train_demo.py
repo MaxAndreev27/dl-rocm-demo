@@ -151,7 +151,7 @@ class TelemetrySample:
     gpu_total: float
 
 
-def _sample_telemetry() -> TelemetrySample:
+def sample_telemetry() -> TelemetrySample:
     cpu_temp, gpu_temp = _read_hwmon_temperatures()
     gpu_free, gpu_total = torch.cuda.mem_get_info()
     ram_used, ram_total, process_rss = _read_memory_usage()
@@ -169,7 +169,7 @@ def _sample_telemetry() -> TelemetrySample:
     )
 
 
-def _read_kernel_log() -> tuple[list[str] | None, str | None]:
+def read_kernel_log() -> tuple[list[str] | None, str | None]:
     try:
         result = subprocess.run(
             ["dmesg", "--color=never"],
@@ -188,7 +188,7 @@ def _read_kernel_log() -> tuple[list[str] | None, str | None]:
     return result.stdout.splitlines(), None
 
 
-def _report_gpu_kernel_faults(
+def report_gpu_kernel_faults(
     before: list[str] | None,
     before_error: str | None,
     after: list[str] | None,
@@ -350,7 +350,7 @@ def run_long_test(
     )
     print(f"device={torch.cuda.get_device_name(0)} torch={torch.__version__} hip={torch.version.hip}")
 
-    before, before_error = _read_kernel_log()
+    before, before_error = read_kernel_log()
     if before is not None:
         print("GPU page-fault check: monitoring new kernel log messages")
 
@@ -358,7 +358,7 @@ def run_long_test(
     epoch_samples: list[TelemetrySample] = []
 
     def sample_batch() -> None:
-        epoch_samples.append(_sample_telemetry())
+        epoch_samples.append(sample_telemetry())
 
     def report_epoch(epoch: int, elapsed: float) -> None:
         epoch_times.append(elapsed)
@@ -396,8 +396,8 @@ def run_long_test(
         on_epoch_end=report_epoch,
         on_batch=sample_batch,
     )
-    after, after_error = _read_kernel_log()
-    gpu_fault_check = _report_gpu_kernel_faults(
+    after, after_error = read_kernel_log()
+    gpu_fault_check = report_gpu_kernel_faults(
         before, before_error, after, after_error
     )
     print(
