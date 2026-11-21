@@ -68,6 +68,62 @@ def bench_conv2d(
     return dt, gflops
 
 
+def bench_transformer_ops(
+    device: str,
+    dtype: torch.dtype,
+    batch_size: int = 4,
+    seq_len: int = 512,
+    num_heads: int = 8,
+    head_dim: int = 64,
+    iters: int = 10,
+    warmup: int = 2,
+) -> tuple[float, float, float]:
+    """Benchmark attention forward/backward and verify softmax and gradients."""
+    shape = (batch_size, num_heads, seq_len, head_dim)
+    q, k, v = (
+        torch.randn(*shape, device=device, dtype=dtype, requires_grad=True)
+        for _ in range(3)
+    )
+
+    def step() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q.grad = k.grad = v.grad = None
+        scores = torch.matmul(q, k.transpose(-2, -1)) * (head_dim**-0.5)
+        weights = torch.softmax(scores, dim=-1)
+        output = torch.matmul(weights, v)
+        loss = output.float().square().mean()
+        loss.backward()
+        return weights, output, loss
+
+    for _ in range(warmup):
+        step()
+    sync(device)
+
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        weights, output, loss = step()
+    sync(device)
+    dt = (time.perf_counter() - t0) / iters
+
+    expected_shape = (batch_size, num_heads, seq_len, head_dim)
+    if output.shape != expected_shape:
+        raise RuntimeError(f"Attention output has unexpected shape: {output.shape}")
+    if not torch.isfinite(output).all().item() or not torch.isfinite(weights).all().item():
+        raise RuntimeError("Attention output or Softmax contains non-finite values")
+    row_sums = weights.float().sum(dim=-1)
+    if not torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-2, rtol=1e-2):
+        raise RuntimeError("Softmax rows do not sum to 1")
+    grads = (q.grad, k.grad, v.grad)
+    if any(grad is None or not torch.isfinite(grad).all().item() for grad in grads):
+        raise RuntimeError("Attention backward produced missing or non-finite gradients")
+    grad_magnitude = sum(grad.float().abs().sum() for grad in grads if grad is not None)
+    if grad_magnitude.item() <= 0:
+        raise RuntimeError("Attention backward produced zero gradients")
+
+    flops = 12 * batch_size * num_heads * seq_len**2 * head_dim
+    gflops = flops / dt / 1e9
+    return dt, gflops, float(loss.item())
+
+
 def bench_matmul(
     device: str,
     dtype: torch.dtype,
@@ -164,7 +220,23 @@ def main() -> int:
     print(f"GPU fp16 speedup vs CPU fp32: x{gpu_conv / cpu_conv:.2f}")
 
     print("\n" + line)
-    print(f"Test 2: Matmul {N}x{N}, FP16/BF16 (higher GFLOPS is better)")
+    print("Test 2: Transformer operations — attention, Softmax, forward + backward")
+    print(line)
+    transformer_rows = [
+        ("CPU fp32", *bench_transformer_ops("cpu", torch.float32)),
+        ("GPU fp16", *bench_transformer_ops("cuda", torch.float16)),
+    ]
+    for name, dt, gflops, loss in transformer_rows:
+        print(
+            f"{name:<10} {dt * 1e3:9.2f} ms   {gflops:9.1f} GFLOPS "
+            f"loss={loss:.5f} checks=ok"
+        )
+    cpu_transformer = next(g for n, _, g, _ in transformer_rows if n == "CPU fp32")
+    gpu_transformer = next(g for n, _, g, _ in transformer_rows if n == "GPU fp16")
+    print(f"GPU fp16 speedup vs CPU fp32: x{gpu_transformer / cpu_transformer:.2f}")
+
+    print("\n" + line)
+    print(f"Test 3: Matmul {N}x{N}, FP16/BF16 (higher GFLOPS is better)")
     print(line)
     rows: list[tuple[str, float, float]] = []
     rows.append(("CPU fp32", *bench_matmul("cpu", torch.float32)))
