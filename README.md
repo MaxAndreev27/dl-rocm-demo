@@ -34,11 +34,17 @@ uv run python check_gpu.py
 uv run python train_demo.py
 uv run python train_demo.py --epochs 3 --device cuda
 
+# Run Test 3: 100 epochs, about 2.5 minutes on the tested Radeon 780M.
+# Actual duration varies with GPU clocks, thermals, and background load.
+timeout 30m uv run python train_demo.py --long-test
+
 # Start JupyterLab, if installed in the environment.
 uv run jupyter lab
 ```
 
 Alternatively, open `demo.ipynb` in VS Code or Cursor and select `.venv/bin/python` as the notebook kernel.
+
+Test 3 trains the GPU for 100 epochs by default (select 20–100 with `--long-test-epochs`). On the tested Radeon 780M, the estimate is about 2.5 minutes, extrapolated from the measured 25-epoch run; actual duration varies with GPU clocks, thermals, and background load. It samples temperature, GPU clock, RAM, and GPU memory several times during each epoch and reports the observed peak temperatures/clock plus epoch speed. Each epoch synchronizes with the GPU, so a completed run confirms all epochs finished. New AMD GPU fault/reset messages are checked in `dmesg`; if kernel-log access is restricted, the test reports that check as unavailable rather than claiming no faults occurred. `timeout` provides a process-level guard against a hung run.
 
 ## Example results
 
@@ -62,7 +68,7 @@ The following measurements were recorded on a Radeon 780M (`gfx1103`):
 
 Results depend on power limits, cooling, and background load. On an APU, the GPU can be much faster for large matrix multiplications and convolutions, while small models may see a smaller improvement or run faster on the CPU.
 
-`check_gpu.py` runs **Test 1: Conv2D** and **Test 2: Transformer operations** (scaled dot-product attention, Softmax, and backward pass) on CPU fp32 vs GPU fp16. The transformer test checks output shape, Softmax normalization, and finite nonzero gradients. Its GFLOPS estimate counts attention matrix multiplications in forward and backward; Softmax operations are not included. The interactive notebook contains both benchmarks.
+`check_gpu.py` runs **Test 1: Conv2D** and **Test 2: Transformer operations** (scaled dot-product attention, Softmax, and backward pass) on CPU fp32 vs GPU fp16. **Test 3** is the optional long-duration GPU training run above. The transformer test checks output shape, Softmax normalization, and finite nonzero gradients. Its GFLOPS estimate counts attention matrix multiplications in forward and backward; Softmax operations are not included. The interactive notebook contains all three tests.
 
 ## Notes and troubleshooting
 

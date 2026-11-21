@@ -235,8 +235,9 @@ def main() -> int:
     gpu_transformer = next(g for n, _, g, _ in transformer_rows if n == "GPU fp16")
     print(f"GPU fp16 speedup vs CPU fp32: x{gpu_transformer / cpu_transformer:.2f}")
 
+    print("\nTest 3 (long-run stability): uv run python train_demo.py --long-test")
     print("\n" + line)
-    print(f"Test 3: Matmul {N}x{N}, FP16/BF16 (higher GFLOPS is better)")
+    print(f"Test 4: Matmul {N}x{N}, FP16/BF16 (higher GFLOPS is better)")
     print(line)
     rows: list[tuple[str, float, float]] = []
     rows.append(("CPU fp32", *bench_matmul("cpu", torch.float32)))

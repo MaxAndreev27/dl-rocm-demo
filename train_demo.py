@@ -8,14 +8,20 @@ Usage:
     uv run python train_demo.py                 # CPU fp32 vs GPU fp16
     uv run python train_demo.py --epochs 3
     uv run python train_demo.py --device cuda
+    uv run python train_demo.py --long-test
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+import re
+import subprocess
 import time
+from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -61,6 +67,149 @@ def make_data(
     return imgs, labels
 
 
+def _read_hwmon_temperatures() -> tuple[float | None, float | None]:
+    cpu_temps: list[float] = []
+    gpu_temps: list[float] = []
+    for hwmon in Path("/sys/class/hwmon").glob("hwmon*"):
+        try:
+            name = (hwmon / "name").read_text().strip().lower()
+        except FileNotFoundError:
+            continue
+        for temp_file in hwmon.glob("temp*_input"):
+            label_file = temp_file.with_name(temp_file.name.replace("_input", "_label"))
+            try:
+                label = label_file.read_text().strip().lower()
+            except FileNotFoundError:
+                label = ""
+            try:
+                value = int(temp_file.read_text().strip()) / 1000
+            except FileNotFoundError:
+                continue
+            except ValueError:
+                continue
+            if name in ("k10temp", "coretemp", "zenpower") or any(
+                marker in label for marker in ("cpu", "tctl", "tdie")
+            ):
+                cpu_temps.append(value)
+            if "amdgpu" in name or "gpu" in name or "gpu" in label:
+                gpu_temps.append(value)
+    return (
+        max(cpu_temps) if cpu_temps else None,
+        max(gpu_temps) if gpu_temps else None,
+    )
+
+
+def _read_gpu_clock_mhz() -> float | None:
+    for clock_file in Path("/sys/class/drm").glob("card[0-9]*/device/pp_dpm_sclk"):
+        try:
+            lines = clock_file.read_text().splitlines()
+        except FileNotFoundError:
+            continue
+        for line in lines:
+            if "*" in line:
+                match = re.search(r"([\d.]+)\s*MHz", line, re.IGNORECASE)
+                if match:
+                    return float(match.group(1))
+    return None
+
+
+def _read_memory_usage() -> tuple[float, float, float]:
+    meminfo: dict[str, int] = {}
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        key, value = line.split(":", maxsplit=1)
+        if key in ("MemTotal", "MemAvailable"):
+            meminfo[key] = int(value.split()[0]) * 1024
+    rss = next(
+        int(line.split()[1]) * 1024
+        for line in Path("/proc/self/status").read_text().splitlines()
+        if line.startswith("VmRSS:")
+    )
+    total = meminfo["MemTotal"]
+    used = total - meminfo["MemAvailable"]
+    return used / 2**30, total / 2**30, rss / 2**30
+
+
+@dataclass
+class TelemetrySample:
+    cpu_temp: float | None
+    gpu_temp: float | None
+    gpu_clock: float | None
+    ram_used: float
+    ram_total: float
+    process_rss: float
+    gpu_allocated: float
+    gpu_reserved: float
+    gpu_free: float
+    gpu_total: float
+
+
+def _sample_telemetry() -> TelemetrySample:
+    cpu_temp, gpu_temp = _read_hwmon_temperatures()
+    gpu_free, gpu_total = torch.cuda.mem_get_info()
+    ram_used, ram_total, process_rss = _read_memory_usage()
+    return TelemetrySample(
+        cpu_temp=cpu_temp,
+        gpu_temp=gpu_temp,
+        gpu_clock=_read_gpu_clock_mhz(),
+        ram_used=ram_used,
+        ram_total=ram_total,
+        process_rss=process_rss,
+        gpu_allocated=torch.cuda.memory_allocated() / 2**30,
+        gpu_reserved=torch.cuda.memory_reserved() / 2**30,
+        gpu_free=gpu_free / 2**30,
+        gpu_total=gpu_total / 2**30,
+    )
+
+
+def _read_kernel_log() -> tuple[list[str] | None, str | None]:
+    try:
+        result = subprocess.run(
+            ["dmesg", "--color=never"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except FileNotFoundError:
+        return None, "dmesg is not installed"
+    except subprocess.TimeoutExpired:
+        return None, "dmesg timed out"
+    if result.returncode != 0:
+        reason = result.stderr.strip() or f"dmesg exited with status {result.returncode}"
+        return None, reason
+    return result.stdout.splitlines(), None
+
+
+def _report_gpu_kernel_faults(
+    before: list[str] | None,
+    before_error: str | None,
+    after: list[str] | None,
+    after_error: str | None,
+) -> bool | None:
+    if before is None or after is None:
+        reason = before_error or after_error or "kernel log is unavailable"
+        print(f"GPU page-fault check: unavailable ({reason})")
+        return None
+
+    new_lines = (Counter(after) - Counter(before)).elements()
+    fault_pattern = re.compile(
+        r"(?:amdgpu|kfd|gpu).*(?:page fault|vm fault|protection fault|fault|reset|timeout|hang)",
+        re.IGNORECASE,
+    )
+    faults = [line for line in new_lines if fault_pattern.search(line)]
+    if faults:
+        print(f"GPU kernel fault check: FAIL ({len(faults)} new matching messages)")
+        for line in faults[:5]:
+            print(f"  {line}")
+        return False
+    print("GPU kernel fault check: no new AMD GPU fault/reset messages")
+    return True
+
+
+def _format_sensor(value: float | None, unit: str) -> str:
+    return f"{value:.0f}{unit}" if value is not None else "N/A"
+
+
 @dataclass
 class Result:
     name: str
@@ -80,6 +229,8 @@ def run(
     batch_size: int,
     lr: float,
     seed: int,
+    on_epoch_end: Callable[[int, float], None] | None = None,
+    on_batch: Callable[[], None] | None = None,
 ) -> Result:
     torch.manual_seed(seed)
     model = SmallCNN().to(device)
@@ -114,8 +265,11 @@ def run(
         torch.cuda.empty_cache()
 
     t0 = time.perf_counter()
-    for _ in range(epochs):
-        for xb, yb in train_loader:
+    epoch_seconds: list[float] = []
+    sample_every = max(1, len(train_loader) // 4)
+    for epoch in range(epochs):
+        epoch_t0 = time.perf_counter() if on_epoch_end is not None else 0.0
+        for batch_index, (xb, yb) in enumerate(train_loader):
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
             if device == "cuda":
@@ -126,9 +280,17 @@ def run(
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            if on_batch is not None and (batch_index + 1) % sample_every == 0:
+                on_batch()
+        if on_epoch_end is not None:
+            if device == "cuda":
+                torch.cuda.synchronize()
+            elapsed = time.perf_counter() - epoch_t0
+            epoch_seconds.append(elapsed)
+            on_epoch_end(epoch + 1, elapsed)
     if device == "cuda":
         torch.cuda.synchronize()
-    seconds = time.perf_counter() - t0
+    seconds = sum(epoch_seconds) if on_epoch_end is not None else time.perf_counter() - t0
 
     model.eval()
     correct = total = 0
@@ -150,9 +312,115 @@ def run(
     return Result(name, seconds, last_loss, correct / total, peak)
 
 
+def run_long_test(
+    epochs: int = 100,
+    batch_size: int = 64,
+    train_size: int = 16384,
+    test_size: int = 1024,
+    lr: float = 2e-3,
+    seed: int = 42,
+) -> int:
+    if not 20 <= epochs <= 100:
+        raise ValueError("Long-test epochs must be between 20 and 100")
+    if batch_size <= 0 or train_size <= 0 or test_size <= 0:
+        raise ValueError("Long-test batch, train, and test sizes must be positive")
+    if not torch.cuda.is_available():
+        print("CUDA/ROCm is unavailable; the long GPU stability test cannot run.")
+        return 1
+
+    prototypes = make_prototypes(seed=seed)
+    xtr, ytr = make_data(prototypes, train_size, seed=seed)
+    xte, yte = make_data(prototypes, test_size, seed=seed + 1)
+    train_ds = TensorDataset(xtr, ytr)
+    test_ds = TensorDataset(xte, yte)
+    base = SmallCNN()
+    init_state = copy.deepcopy(base.state_dict())
+    params = sum(p.numel() for p in base.parameters())
+    print(
+        f"Test 3: long GPU load — epochs={epochs} train={train_size} "
+        f"batch={batch_size} params={params:,}"
+    )
+    print(f"device={torch.cuda.get_device_name(0)} torch={torch.__version__} hip={torch.version.hip}")
+
+    before, before_error = _read_kernel_log()
+    if before is not None:
+        print("GPU page-fault check: monitoring new kernel log messages")
+
+    epoch_times: list[float] = []
+    epoch_samples: list[TelemetrySample] = []
+
+    def sample_batch() -> None:
+        epoch_samples.append(_sample_telemetry())
+
+    def report_epoch(epoch: int, elapsed: float) -> None:
+        epoch_times.append(elapsed)
+        cpu_temps = [s.cpu_temp for s in epoch_samples if s.cpu_temp is not None]
+        gpu_temps = [s.gpu_temp for s in epoch_samples if s.gpu_temp is not None]
+        gpu_clocks = [s.gpu_clock for s in epoch_samples if s.gpu_clock is not None]
+        ram_used = max(s.ram_used for s in epoch_samples)
+        ram_total = epoch_samples[-1].ram_total
+        process_rss = max(s.process_rss for s in epoch_samples)
+        gpu_allocated = max(s.gpu_allocated for s in epoch_samples)
+        gpu_reserved = max(s.gpu_reserved for s in epoch_samples)
+        gpu_free = min(s.gpu_free for s in epoch_samples)
+        gpu_total = epoch_samples[-1].gpu_total
+        print(
+            f"epoch {epoch:02}/{epochs} {elapsed:6.2f}s | "
+            f"CPU max {_format_sensor(max(cpu_temps) if cpu_temps else None, 'C')} "
+            f"GPU max {_format_sensor(max(gpu_temps) if gpu_temps else None, 'C')} "
+            f"clock peak {_format_sensor(max(gpu_clocks) if gpu_clocks else None, ' MHz')} | "
+            f"RAM {ram_used:.1f}/{ram_total:.1f} GiB RSS {process_rss:.1f} GiB | "
+            f"GTT free {gpu_free:.1f}/{gpu_total:.1f} GiB "
+            f"alloc/res {gpu_allocated:.2f}/{gpu_reserved:.2f} GiB"
+        )
+        epoch_samples.clear()
+
+    result = run(
+        "cuda",
+        torch.float16,
+        train_ds,
+        test_ds,
+        init_state,
+        epochs,
+        batch_size,
+        lr,
+        seed,
+        on_epoch_end=report_epoch,
+        on_batch=sample_batch,
+    )
+    after, after_error = _read_kernel_log()
+    gpu_fault_check = _report_gpu_kernel_faults(
+        before, before_error, after, after_error
+    )
+    print(
+        f"Completed {epochs} synchronized epochs; "
+        f"avg={result.seconds / epochs:.2f}s/epoch "
+        f"min={min(epoch_times):.2f}s max={max(epoch_times):.2f}s "
+        f"last/first={epoch_times[-1] / epoch_times[0]:.2f}x"
+    )
+    print(
+        f"Final loss={result.loss:.3f} accuracy={result.accuracy * 100:.1f}% "
+        f"peak GPU allocation={result.peak_gib:.2f} GiB"
+    )
+    return 2 if gpu_fault_check is False else 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument(
+        "--long-test",
+        action="store_true",
+        help="Run the 20-100 epoch GPU stability test",
+    )
+    parser.add_argument(
+        "--long-test-epochs",
+        type=int,
+        metavar="N",
+        default=100,  # About 2.5 minutes on the tested Radeon 780M; varies by load.
+        help="Epoch count from 20 to 100 (default: 100)",
+    )
+    parser.add_argument("--long-test-size", type=int, default=16384)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--train-size", type=int, default=4096)
     parser.add_argument("--test-size", type=int, default=1024)
@@ -160,6 +428,20 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=["both", "cpu", "cuda"], default="both")
     args = parser.parse_args()
+
+    if args.long_test:
+        if not 20 <= args.long_test_epochs <= 100:
+            parser.error("--long-test-epochs must be between 20 and 100")
+        if args.device == "cpu":
+            parser.error("--long-test requires the GPU; use --device cuda or omit --device")
+        return run_long_test(
+            args.long_test_epochs,
+            args.batch_size,
+            train_size=args.long_test_size,
+            test_size=args.test_size,
+            lr=args.lr,
+            seed=args.seed,
+        )
 
     if not torch.cuda.is_available():
         print("CUDA/ROCm is unavailable; only the CPU will be used.")
