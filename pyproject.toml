@@ -10,6 +10,7 @@ requires-python = ">=3.13"
 dependencies = [
     "torch[device-gfx1103]==2.14.0+rocm10.2.0",
     "torchvision==0.29.0+rocm10.2.0",
+    "sentence-transformers>=5.0.0",
     "transformers>=5.0.0",
 ]
 
