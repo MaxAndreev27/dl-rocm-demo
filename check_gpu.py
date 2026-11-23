@@ -10,13 +10,14 @@ are kept in .venv (rocm-sdk-*); the system-wide /opt/rocm is not used.
 
 from __future__ import annotations
 
+import argparse
 import os
 import platform
 import sys
 import time
 from pathlib import Path
 
-from benchmark_logs import CHILD_ENV, run_logged
+from benchmark_logs import CHILD_ENV, report_comparison, run_logged
 
 if __name__ == "__main__" and os.environ.get(CHILD_ENV) != "1":
     sys.exit(
@@ -27,8 +28,7 @@ if __name__ == "__main__" and os.environ.get(CHILD_ENV) != "1":
             {
                 "Test 1: Conv2D": "conv2d.txt",
                 "Test 2: Transformer operations": "transformer.txt",
-                "Test 3 (long-run stability)": "long_test_instructions.txt",
-                "Test 4: Matmul": "matmul.txt",
+                "Test 3: Matmul": "matmul.txt",
                 "Copying 256 MiB": "memory_copy.txt",
                 "GPU memory": "gpu_memory.txt",
             },
@@ -195,6 +195,18 @@ def bench_copy(device: str, mib: int = 256, iters: int = 10) -> float:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--device",
+        choices=("both", "cpu", "cuda"),
+        default="both",
+        help="Bench both devices in CPU-then-iGPU order, or select one",
+    )
+    args = parser.parse_args()
+    run_cpu = args.device in ("both", "cpu")
+    run_gpu = args.device in ("both", "cuda")
+    gpu_available = torch.cuda.is_available()
+
     line = "=" * 72
     print(line)
     print("ROCm / PyTorch check — local venv, no system-wide ROCm")
@@ -210,94 +222,142 @@ def main() -> int:
     else:
         print("HSA_OVERRIDE : not set (correct)")
 
-    if not torch.cuda.is_available():
-        print("\nGPU not detected. Check /dev/kfd, render/video groups, and rocm-sdk-* wheels.")
+    if run_gpu and not gpu_available and args.device == "cuda":
+        print("\niGPU not detected. Check /dev/kfd, render/video groups, and rocm-sdk-* wheels.")
         return 1
 
-    props = torch.cuda.get_device_properties(0)
-    print(f"device       : {torch.cuda.get_device_name(0)}")
-    print(f"arch         : {props.gcnArchName}")
-    print(f"memory (GTT) : {props.total_memory / 2**30:.2f} GiB")
-    print(f"CU (reported): {props.multi_processor_count}")
-
-    # Quickly verify that kernels can actually run.
-    x = torch.randn(1024, 1024, device="cuda", dtype=torch.float16)
-    sanity = (x @ x).float().mean().item()
-    del x
-    torch.cuda.empty_cache()
-    print(f"matmul sanity: {sanity:.4f}  (ok)")
+    if gpu_available:
+        props = torch.cuda.get_device_properties(0)
+        print(f"device       : {torch.cuda.get_device_name(0)}")
+        print(f"arch         : {props.gcnArchName}")
+        print(f"memory (GTT) : {props.total_memory / 2**30:.2f} GiB")
+        print(f"CU (reported): {props.multi_processor_count}")
 
     print("\n" + line)
     print("Test 1: Conv2D forward, 16x3x128x128 -> 32 channels, 3x3")
     print(line)
-    conv_rows = [
-        ("CPU fp32", *bench_conv2d("cpu", torch.float32)),
-        ("GPU fp16", *bench_conv2d("cuda", torch.float16)),
-    ]
+    conv_rows: list[tuple[str, float, float]] = []
+    if run_cpu:
+        conv_rows.append(("CPU fp32", *bench_conv2d("cpu", torch.float32)))
+    if run_gpu and gpu_available:
+        x = torch.randn(1024, 1024, device="cuda", dtype=torch.float16)
+        sanity = (x @ x).float().mean().item()
+        del x
+        torch.cuda.empty_cache()
+        print(f"matmul sanity: {sanity:.4f}  (ok)")
+        conv_rows.append(("iGPU fp16", *bench_conv2d("cuda", torch.float16)))
     for name, dt, gflops in conv_rows:
         print(f"{name:<10} {dt * 1e3:9.2f} ms   {gflops:9.1f} GFLOPS")
-    cpu_conv = next(g for n, _, g in conv_rows if n == "CPU fp32")
-    gpu_conv = next(g for n, _, g in conv_rows if n == "GPU fp16")
-    print(f"GPU fp16 speedup vs CPU fp32: x{gpu_conv / cpu_conv:.2f}")
+    if run_cpu and run_gpu and gpu_available:
+        cpu_conv = next(g for n, _, g in conv_rows if n == "CPU fp32")
+        gpu_conv = next(g for n, _, g in conv_rows if n == "iGPU fp16")
+        report_comparison(
+            "Conv2D throughput (fp32 vs fp16)",
+            cpu_conv,
+            gpu_conv,
+            " GFLOPS",
+            higher_is_better=True,
+        )
 
     print("\n" + line)
     print("Test 2: Transformer operations — attention, Softmax, forward + backward")
     print(line)
-    transformer_rows = [
-        ("CPU fp32", *bench_transformer_ops("cpu", torch.float32)),
-        ("GPU fp16", *bench_transformer_ops("cuda", torch.float16)),
-    ]
+    transformer_rows: list[tuple[str, float, float, float]] = []
+    if run_cpu:
+        transformer_rows.append(
+            ("CPU fp32", *bench_transformer_ops("cpu", torch.float32))
+        )
+    if run_gpu and gpu_available:
+        transformer_rows.append(
+            ("iGPU fp16", *bench_transformer_ops("cuda", torch.float16))
+        )
     for name, dt, gflops, loss in transformer_rows:
         print(
             f"{name:<10} {dt * 1e3:9.2f} ms   {gflops:9.1f} GFLOPS "
             f"loss={loss:.5f} checks=ok"
         )
-    cpu_transformer = next(g for n, _, g, _ in transformer_rows if n == "CPU fp32")
-    gpu_transformer = next(g for n, _, g, _ in transformer_rows if n == "GPU fp16")
-    print(f"GPU fp16 speedup vs CPU fp32: x{gpu_transformer / cpu_transformer:.2f}")
+    if run_cpu and run_gpu and gpu_available:
+        cpu_transformer = next(
+            g for n, _, g, _ in transformer_rows if n == "CPU fp32"
+        )
+        gpu_transformer = next(
+            g for n, _, g, _ in transformer_rows if n == "iGPU fp16"
+        )
+        report_comparison(
+            "attention throughput (fp32 vs fp16)",
+            cpu_transformer,
+            gpu_transformer,
+            " GFLOPS",
+            higher_is_better=True,
+        )
 
-    print("\nTest 3 (long-run stability): uv run python train_demo.py --long-test")
     print("\n" + line)
-    print(f"Test 4: Matmul {N}x{N}, FP16/BF16 (higher GFLOPS is better)")
+    print(f"Test 3: Matmul {N}x{N}, FP16/BF16 (higher GFLOPS is better)")
     print(line)
     rows: list[tuple[str, float, float]] = []
-    rows.append(("CPU fp32", *bench_matmul("cpu", torch.float32)))
-    try:
-        rows.append(("CPU bf16", *bench_matmul("cpu", torch.bfloat16)))
-    except Exception as exc:  # noqa: BLE001
-        print(f"CPU bf16 skipped: {exc}")
-    try:
-        rows.append(("GPU fp16", *bench_matmul("cuda", torch.float16)))
-        rows.append(("GPU bf16", *bench_matmul("cuda", torch.bfloat16)))
-    except Exception as exc:  # noqa: BLE001
-        print(f"\nGPU benchmark failed: {exc}")
-        print("Restart the script. If the problem persists, check dmesg and GPU temperature.")
-        return 2
+    if run_cpu:
+        rows.append(("CPU fp32", *bench_matmul("cpu", torch.float32)))
+        try:
+            rows.append(("CPU bf16", *bench_matmul("cpu", torch.bfloat16)))
+        except Exception as exc:  # noqa: BLE001
+            print(f"CPU bf16 skipped: {exc}")
+    if run_gpu and gpu_available:
+        try:
+            rows.append(("iGPU fp16", *bench_matmul("cuda", torch.float16)))
+            rows.append(("iGPU bf16", *bench_matmul("cuda", torch.bfloat16)))
+        except Exception as exc:  # noqa: BLE001
+            print(f"\niGPU benchmark failed: {exc}")
+            print("Restart the script. If the problem persists, check dmesg and GPU temperature.")
+            return 2
 
     for name, dt, gflops in rows:
         print(f"{name:<10} {dt * 1e3:9.2f} ms   {gflops:9.1f} GFLOPS")
 
-    gpu_fp16 = next(g for n, _, g in rows if n == "GPU fp16")
-    cpu_fp32 = next(g for n, _, g in rows if n == "CPU fp32")
-    print(f"\nGPU fp16 speedup vs CPU fp32: x{gpu_fp16 / cpu_fp32:.2f}")
+    if run_cpu and run_gpu and gpu_available:
+        gpu_fp16 = next(g for n, _, g in rows if n == "iGPU fp16")
+        cpu_fp32 = next(g for n, _, g in rows if n == "CPU fp32")
+        report_comparison(
+            "matmul throughput (fp32 vs fp16)",
+            cpu_fp32,
+            gpu_fp16,
+            " GFLOPS",
+            higher_is_better=True,
+        )
 
     print("\n" + line)
     print("Copying 256 MiB (rough estimate of memory bandwidth)")
     print(line)
-    cpu_bw = bench_copy("cpu")
-    gpu_bw = bench_copy("cuda")
-    print(f"CPU: {cpu_bw:7.1f} GB/s")
-    print(f"GPU: {gpu_bw:7.1f} GB/s  (GTT, shared DDR5)")
+    cpu_bw = bench_copy("cpu") if run_cpu else None
+    gpu_bw = bench_copy("cuda") if run_gpu and gpu_available else None
+    if cpu_bw is not None:
+        print(f"CPU: {cpu_bw:7.1f} GB/s")
+    if gpu_bw is not None:
+        print(f"iGPU: {gpu_bw:7.1f} GB/s  (GTT, shared DDR5)")
+    if cpu_bw is not None and gpu_bw is not None:
+        report_comparison(
+            "memory-copy bandwidth",
+            cpu_bw,
+            gpu_bw,
+            " GB/s",
+            higher_is_better=True,
+        )
 
-    print("\n" + line)
-    print("GPU memory")
-    print(line)
-    free, total = torch.cuda.mem_get_info()
-    print(f"free/total : {free / 2**30:.2f} / {total / 2**30:.2f} GiB")
-    print(f"allocated  : {torch.cuda.memory_allocated() / 2**30:.2f} GiB")
-    print(f"reserved   : {torch.cuda.memory_reserved() / 2**30:.2f} GiB")
+    if run_gpu and gpu_available:
+        print("\n" + line)
+        print("GPU memory")
+        print(line)
+        free, total = torch.cuda.mem_get_info()
+        print(f"free/total : {free / 2**30:.2f} / {total / 2**30:.2f} GiB")
+        print(f"allocated  : {torch.cuda.memory_allocated() / 2**30:.2f} GiB")
+        print(f"reserved   : {torch.cuda.memory_reserved() / 2**30:.2f} GiB")
 
-    print("\nOK: iGPU is available to PyTorch.")
+    if not gpu_available and args.device == "both":
+        print("\nCPU benchmarks completed; iGPU comparison unavailable (ROCm not detected).")
+        return 1
+    if not run_cpu or not run_gpu:
+        selected = "cuda" if not run_cpu else "cpu"
+        print(f"\nCPU/iGPU comparison not run (--device {selected}).")
+    print("\nOK: requested benchmarks completed.")
     return 0
 
 

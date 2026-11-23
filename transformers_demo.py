@@ -12,9 +12,10 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
 
-from benchmark_logs import CHILD_ENV, run_logged
+from benchmark_logs import CHILD_ENV, report_comparison, run_logged
 
 if __name__ == "__main__" and os.environ.get(CHILD_ENV) != "1":
     raise SystemExit(
@@ -22,7 +23,71 @@ if __name__ == "__main__" and os.environ.get(CHILD_ENV) != "1":
     )
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
+
+
+def run_generation(
+    model_id: str,
+    tokenizer: PreTrainedTokenizerBase,
+    prompt: str,
+    max_new_tokens: int,
+    seed: int,
+    device: str,
+) -> tuple[int, float, str]:
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    print(f"\nLoading {model_id!r} on {'iGPU' if device == 'cuda' else 'CPU'} ({dtype})...")
+    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype).to(device)
+    model.eval()
+    encoded = tokenizer(prompt, return_tensors="pt")
+    input_ids = encoded["input_ids"].to(device)
+    attention_mask = encoded["attention_mask"].to(device)
+
+    if device == "cuda":
+        torch.cuda.synchronize()
+    torch.manual_seed(seed)
+    with torch.inference_mode():
+        model.generate(
+            input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=min(3, max_new_tokens),
+            do_sample=True,
+            temperature=0.8,
+            top_p=0.9,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+    if device == "cuda":
+        torch.cuda.synchronize()
+
+    torch.manual_seed(seed)
+    start = time.perf_counter()
+    with torch.inference_mode():
+        output_ids = model.generate(
+            input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=0.8,
+            top_p=0.9,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+    if device == "cuda":
+        torch.cuda.synchronize()
+    elapsed = time.perf_counter() - start
+
+    continuation_ids = output_ids[0, input_ids.shape[-1] :]
+    continuation = tokenizer.decode(continuation_ids, skip_special_tokens=True)
+    generated_tokens = continuation_ids.numel()
+    tokens_per_second = generated_tokens / elapsed
+    label = "iGPU" if device == "cuda" else "CPU"
+    print(f"{label} generated text: {continuation}")
+    print(
+        f"{label}: tokens={generated_tokens}, time={elapsed:.3f}s, "
+        f"throughput={tokens_per_second:.2f} tokens/s"
+    )
+    del model
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    return generated_tokens, tokens_per_second, continuation
 
 
 def main() -> int:
@@ -45,9 +110,15 @@ def main() -> int:
     )
     parser.add_argument(
         "--device",
-        choices=("auto", "cpu", "cuda"),
-        default="auto",
-        help="Inference device; 'cuda' also selects ROCm in PyTorch",
+        choices=("both", "cpu", "cuda"),
+        default="both",
+        help="Compare CPU then iGPU by default; optionally select one device",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed used for generation on each device",
     )
     args = parser.parse_args()
 
@@ -56,44 +127,51 @@ def main() -> int:
     if args.max_new_tokens <= 0:
         parser.error("--max-new-tokens must be positive")
 
-    if args.device == "cuda" and not torch.cuda.is_available():
+    gpu_available = torch.cuda.is_available()
+    if args.device == "cuda" and not gpu_available:
         parser.error("--device cuda was requested, but no CUDA/ROCm device is available")
-    device = (
-        "cuda"
-        if args.device == "cuda" or (args.device == "auto" and torch.cuda.is_available())
-        else "cpu"
-    )
-    dtype = torch.float16 if device == "cuda" else torch.float32
+    if args.device == "both" and not gpu_available:
+        print("ROCm is unavailable; only the CPU run will be performed.")
 
-    print(f"Loading {args.model!r} on {device}...")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype)
-    model.to(device)
-    model.eval()
-
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    encoded = tokenizer(args.prompt, return_tensors="pt")
-    input_ids = encoded["input_ids"].to(device)
-    print(f"Input tokens: {input_ids.shape[-1]}")
-
-    with torch.inference_mode():
-        output_ids = model.generate(
-            input_ids,
-            attention_mask=encoded["attention_mask"].to(device),
-            max_new_tokens=args.max_new_tokens,
-            do_sample=True,
-            temperature=0.8,
-            top_p=0.9,
-            pad_token_id=tokenizer.pad_token_id,
+    devices = (
+        ["cpu", "cuda"]
+        if args.device == "both" and gpu_available
+        else (["cpu"] if args.device in ("both", "cpu") else ["cuda"])
+    )
+    results: dict[str, tuple[int, float, str]] = {}
+    print(f"Prompt: {args.prompt}")
+    print(f"Input tokens: {len(tokenizer(args.prompt)['input_ids'])}")
+    for device in devices:
+        results[device] = run_generation(
+            args.model,
+            tokenizer,
+            args.prompt,
+            args.max_new_tokens,
+            args.seed,
+            device,
         )
 
-    continuation_ids = output_ids[0, input_ids.shape[-1] :]
-    continuation = tokenizer.decode(continuation_ids, skip_special_tokens=True)
-    print(f"\nPrompt: {args.prompt}")
-    print(f"Generated text: {continuation}")
-    print(f"Generated tokens: {continuation_ids.numel()}")
+    if "cpu" in results and "cuda" in results:
+        cpu_tokens, cpu_rate, _ = results["cpu"]
+        gpu_tokens, gpu_rate, _ = results["cuda"]
+        print(f"Tokens generated: CPU={cpu_tokens}, iGPU={gpu_tokens}")
+        report_comparison(
+            "text-generation throughput",
+            cpu_rate,
+            gpu_rate,
+            " tokens/s",
+            higher_is_better=True,
+        )
+    elif args.device == "both" and not gpu_available:
+        print("CPU result complete; iGPU comparison unavailable (ROCm not detected).")
+    else:
+        print(f"CPU/iGPU comparison not run (--device {args.device}).")
+    if args.device == "both" and not gpu_available:
+        return 1
     return 0
 
 

@@ -12,9 +12,10 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
 
-from benchmark_logs import CHILD_ENV, run_logged
+from benchmark_logs import CHILD_ENV, report_comparison, run_logged
 
 if __name__ == "__main__" and os.environ.get(CHILD_ENV) != "1":
     raise SystemExit(
@@ -60,9 +61,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--device",
-        choices=("auto", "cpu", "cuda"),
-        default="auto",
-        help="Inference device; 'cuda' also selects ROCm in PyTorch",
+        choices=("both", "cpu", "cuda"),
+        default="both",
+        help="Compare CPU then iGPU by default; optionally select one device",
     )
     args = parser.parse_args()
 
@@ -72,43 +73,83 @@ def main() -> int:
         parser.error("--batch-size must be positive")
     if not 1 <= args.top_k <= len(CORPUS):
         parser.error(f"--top-k must be between 1 and {len(CORPUS)}")
-    if args.device == "cuda" and not torch.cuda.is_available():
+    gpu_available = torch.cuda.is_available()
+    if args.device == "cuda" and not gpu_available:
         parser.error("--device cuda was requested, but no CUDA/ROCm device is available")
-    device = (
-        "cuda"
-        if args.device == "cuda" or (args.device == "auto" and torch.cuda.is_available())
-        else "cpu"
+    if args.device == "both" and not gpu_available:
+        print("ROCm is unavailable; only the CPU run will be performed.")
+    devices = (
+        ["cpu", "cuda"]
+        if args.device == "both" and gpu_available
+        else (["cpu"] if args.device in ("both", "cpu") else ["cuda"])
     )
 
-    print(f"Loading {args.model!r} on {device}...")
-    model = SentenceTransformer(args.model, device=device)
-    corpus_embeddings = model.encode(
-        CORPUS,
-        batch_size=args.batch_size,
-        convert_to_tensor=True,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-    )
-    query_embedding = model.encode(
-        [args.query],
-        convert_to_tensor=True,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-    )
+    throughput: dict[str, float] = {}
+    print(f"Query: {args.query}")
+    for device in devices:
+        label = "iGPU" if device == "cuda" else "CPU"
+        print(f"\nLoading {args.model!r} on {label}...")
+        model = SentenceTransformer(args.model, device=device)
+        model.encode(
+            CORPUS[:1],
+            batch_size=1,
+            convert_to_tensor=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        if device == "cuda":
+            torch.cuda.synchronize()
+        start = time.perf_counter()
+        corpus_embeddings = model.encode(
+            CORPUS,
+            batch_size=args.batch_size,
+            convert_to_tensor=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        query_embedding = model.encode(
+            [args.query],
+            batch_size=1,
+            convert_to_tensor=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        if device == "cuda":
+            torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start
 
-    print(
-        f"Encoded {len(CORPUS)} sentences in batches of {args.batch_size}; "
-        f"embedding size: {corpus_embeddings.shape[1]}"
-    )
-    print(f"\nQuery: {args.query}")
-    results = util.semantic_search(
-        query_embedding, corpus_embeddings, top_k=args.top_k
-    )[0]
-    print("Semantic search results:")
-    for rank, result in enumerate(results, start=1):
-        score = float(result["score"])
-        text = CORPUS[int(result["corpus_id"])]
-        print(f"{rank}. score={score:.4f}  {text}")
+        results = util.semantic_search(
+            query_embedding, corpus_embeddings, top_k=args.top_k
+        )[0]
+        print(
+            f"{label}: encoded {len(CORPUS) + 1} sentences in {elapsed:.3f}s "
+            f"({(len(CORPUS) + 1) / elapsed:.2f} sentences/s); "
+            f"embedding size={corpus_embeddings.shape[1]}"
+        )
+        print("Semantic search results:")
+        for rank, result in enumerate(results, start=1):
+            score = float(result["score"])
+            text = CORPUS[int(result["corpus_id"])]
+            print(f"{rank}. score={score:.4f}  {text}")
+        throughput[device] = (len(CORPUS) + 1) / elapsed
+        del model, corpus_embeddings, query_embedding
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+    if "cpu" in throughput and "cuda" in throughput:
+        report_comparison(
+            "sentence-embedding throughput",
+            throughput["cpu"],
+            throughput["cuda"],
+            " sentences/s",
+            higher_is_better=True,
+        )
+    elif args.device == "both" and not gpu_available:
+        print("CPU result complete; iGPU comparison unavailable (ROCm not detected).")
+    else:
+        print(f"CPU/iGPU comparison not run (--device {args.device}).")
+    if args.device == "both" and not gpu_available:
+        return 1
     return 0
 
 

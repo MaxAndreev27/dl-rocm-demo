@@ -1,13 +1,94 @@
 import contextlib
 import io
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from benchmark_logs import run_logged
+from benchmark_logs import (
+    report_comparison,
+    run_logged,
+    start_notebook_logging,
+    stop_notebook_logging,
+)
 
 
 class BenchmarkLogTests(unittest.TestCase):
+    def test_run_logged_forwards_each_output_line_to_callback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = root / "example.py"
+            script.write_text(
+                "print('CPU vs iGPU (timing): CPU=2.000 s, iGPU=1.000 s; "
+                "iGPU faster x2.00 (iGPU speedup x2.000000)')\n",
+                encoding="utf-8",
+            )
+            lines: list[tuple[str, bool]] = []
+            with contextlib.redirect_stdout(io.StringIO()):
+                status = run_logged(
+                    script,
+                    [],
+                    "training.txt",
+                    results_dir=root,
+                    on_line=lambda line, is_stdout: lines.append((line, is_stdout)),
+                )
+            self.assertEqual(status, 0)
+            self.assertIn(
+                (
+                    "CPU vs iGPU (timing): CPU=2.000 s, iGPU=1.000 s; "
+                    "iGPU faster x2.00 (iGPU speedup x2.000000)\n",
+                    True,
+                ),
+                lines,
+            )
+
+    def test_help_output_does_not_replace_benchmark_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = root / "example.py"
+            script.write_text("print('usage: example.py --help')\n", encoding="utf-8")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                status = run_logged(
+                    script, ["--help"], "training.txt", results_dir=root
+                )
+            self.assertEqual(status, 0)
+            self.assertIn("usage: example.py --help", output.getvalue())
+            self.assertFalse((root / "training.txt").exists())
+
+    def test_notebook_output_is_tee_logged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = io.StringIO()
+            errors = io.StringIO()
+            with patch("benchmark_logs.RESULTS_DIR", Path(tmp)):
+                with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                    path = start_notebook_logging("notebook.txt")
+                    print("comparison result")
+                    print("warning", file=sys.stderr)
+                    stop_notebook_logging()
+            self.assertIn("comparison result", output.getvalue())
+            self.assertIn("warning", errors.getvalue())
+            saved = path.read_text(encoding="utf-8")
+            self.assertIn("comparison result", saved)
+            self.assertIn("warning", saved)
+
+    def test_comparison_reports_the_winner_and_speedup(self) -> None:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            speedup = report_comparison(
+                "training time", 4.0, 2.0, " s", higher_is_better=False
+            )
+        self.assertEqual(speedup, 2.0)
+        self.assertIn("iGPU faster x2.00", output.getvalue())
+
+        with contextlib.redirect_stdout(output):
+            speedup = report_comparison(
+                "memory bandwidth", 4.0, 2.0, " GB/s", higher_is_better=True
+            )
+        self.assertEqual(speedup, 0.5)
+        self.assertIn("CPU faster x2.00", output.getvalue())
+
     def test_sections_are_overwritten_independently_and_include_stderr(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

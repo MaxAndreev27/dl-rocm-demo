@@ -10,12 +10,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import os
 import sys
 import time
 from pathlib import Path
 
-from benchmark_logs import CHILD_ENV, run_logged
+from benchmark_logs import CHILD_ENV, report_comparison, run_logged
 
 if __name__ == "__main__" and os.environ.get(CHILD_ENV) != "1":
     raise SystemExit(
@@ -72,6 +73,19 @@ def run_model(
     train_samples = 0
 
     model.train()
+    if device == "cuda":
+        warm_model = copy.deepcopy(model)
+        warm_images, warm_labels = next(
+            iter(DataLoader(train_loader.dataset, batch_size=train_loader.batch_size))
+        )
+        warm_images = warm_images.to(device, non_blocking=True).to(
+            memory_format=torch.channels_last
+        )
+        warm_labels = warm_labels.to(device, non_blocking=True)
+        criterion(warm_model(warm_images), warm_labels).backward()
+        torch.cuda.synchronize()
+        del warm_model
+        torch.cuda.empty_cache()
     sync(device)
     train_start = time.perf_counter()
     for _ in range(epochs):
@@ -134,9 +148,9 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--device",
-        choices=("auto", "cpu", "cuda"),
-        default="auto",
-        help="'cuda' also selects ROCm in PyTorch",
+        choices=("both", "cpu", "cuda"),
+        default="both",
+        help="Bench CPU then iGPU by default; optionally select one device",
     )
     args = parser.parse_args()
 
@@ -148,23 +162,18 @@ def main() -> int:
     if args.image_size < 32:
         parser.error("--image-size must be at least 32")
 
-    device = (
-        "cuda"
-        if args.device == "cuda" or (args.device == "auto" and torch.cuda.is_available())
-        else "cpu"
+    gpu_available = torch.cuda.is_available()
+    if args.device == "both" and not gpu_available:
+        print("ROCm is unavailable; only the CPU run will be performed.")
+    devices = (
+        ["cpu", "cuda"]
+        if args.device == "both" and gpu_available
+        else (["cpu"] if args.device in ("both", "cpu") else ["cuda"])
     )
     num_classes = 10
     prototypes = make_prototypes(num_classes, args.seed)
     train_data = make_data(prototypes, args.train_size, args.image_size, args.seed)
     test_data = make_data(prototypes, args.test_size, args.image_size, args.seed + 1)
-    train_loader = DataLoader(
-        train_data,
-        batch_size=args.batch_size,
-        shuffle=True,
-        generator=torch.Generator().manual_seed(args.seed),
-    )
-    test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False)
-
     model_factories = (
         ("ResNet18", lambda: models.resnet18(weights=None, num_classes=num_classes)),
         (
@@ -172,40 +181,71 @@ def main() -> int:
             lambda: models.mobilenet_v3_small(weights=None, num_classes=num_classes),
         ),
     )
+    print("Computer Vision training/inference | precision=fp32")
     print(
-        f"Computer Vision training/inference | device={device} "
-        "precision=fp32 "
-        f"images={args.image_size}x{args.image_size} "
-        f"train={args.train_size} test={args.test_size} "
-        f"batch={args.batch_size} epochs={args.epochs}"
+        f"images={args.image_size}x{args.image_size} train={args.train_size} "
+        f"test={args.test_size} batch={args.batch_size} epochs={args.epochs}"
     )
     print("Dataset: synthetic class prototypes with noise; pretrained weights disabled.")
 
     for name, create_model in model_factories:
-        torch.manual_seed(args.seed)
-        model = create_model()
-        params = sum(parameter.numel() for parameter in model.parameters())
-        (
-            train_seconds,
-            inference_ms,
-            train_loss,
-            loss,
-            accuracy,
-        ) = run_model(
-            model,
-            train_loader,
-            test_loader,
-            args.test_size,
-            args.epochs,
-            device,
-        )
-        print(
-            f"{name}: params={params:,} train={train_seconds:.2f}s "
-            f"train_loss={train_loss:.4f} "
-            f"inference={inference_ms:.2f}ms/image "
-            f"test_loss={loss:.4f} accuracy={accuracy * 100:.1f}%"
-        )
-        del model
+        results: dict[str, tuple[float, float]] = {}
+        params = 0
+        for device in devices:
+            torch.manual_seed(args.seed)
+            model = create_model()
+            params = sum(parameter.numel() for parameter in model.parameters())
+            train_loader = DataLoader(
+                train_data,
+                batch_size=args.batch_size,
+                shuffle=True,
+                generator=torch.Generator().manual_seed(args.seed),
+            )
+            test_loader = DataLoader(
+                test_data, batch_size=args.batch_size, shuffle=False
+            )
+            (
+                train_seconds,
+                inference_ms,
+                train_loss,
+                loss,
+                accuracy,
+            ) = run_model(
+                model,
+                train_loader,
+                test_loader,
+                args.test_size,
+                args.epochs,
+                device,
+            )
+            label = "iGPU" if device == "cuda" else "CPU"
+            print(
+                f"{name} {label}: params={params:,} train={train_seconds:.2f}s "
+                f"train_loss={train_loss:.4f} "
+                f"inference={inference_ms:.2f}ms/image "
+                f"test_loss={loss:.4f} accuracy={accuracy * 100:.1f}%"
+            )
+            results[device] = (train_seconds, inference_ms)
+            del model
+
+        if "cpu" in results and "cuda" in results:
+            report_comparison(
+                f"{name} training time",
+                results["cpu"][0],
+                results["cuda"][0],
+                " s",
+            )
+            report_comparison(
+                f"{name} inference latency",
+                results["cpu"][1],
+                results["cuda"][1],
+                " ms/image",
+            )
+        else:
+            if args.device == "both" and not gpu_available:
+                print(f"{name}: iGPU comparison unavailable (ROCm not detected).")
+            else:
+                print(f"{name}: CPU/iGPU comparison not run (--device {args.device}).")
     return 0
 
 

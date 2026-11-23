@@ -30,15 +30,18 @@ uv sync
 # Check the environment and benchmark the CPU and iGPU.
 uv run python check_gpu.py
 
-# Train a small CNN: compare CPU fp32 with GPU fp16.
+# Run all CPU/iGPU benchmarks sequentially and print the overall result.
+uv run python run_all_benchmarks.py
+# Train a small CNN: compare CPU first, then iGPU.
 uv run python train_demo.py
-uv run python train_demo.py --epochs 3 --device cuda
+uv run python train_demo.py --epochs 3
+uv run python train_demo.py --device cpu  # Run only on CPU.
 
 # Train and evaluate ResNet18 and MobileNetV3-Small on synthetic images.
 uv run python computer_vision_demo.py
-uv run python computer_vision_demo.py --device cuda --epochs 2
+uv run python computer_vision_demo.py --epochs 2
 
-# Load a small Hugging Face model, tokenize a prompt, and generate text.
+# Generate text on CPU first, then iGPU.
 uv run python transformers_demo.py
 uv run python transformers_demo.py --prompt "The future of AI is" --max-new-tokens 40
 
@@ -46,33 +49,27 @@ uv run python transformers_demo.py --prompt "The future of AI is" --max-new-toke
 uv run python sentence_transformers_demo.py
 uv run python sentence_transformers_demo.py --query "How do I find related text?"
 
-# Run Test 3: 100 epochs, about 2.5 minutes on the tested Radeon 780M.
-# Actual duration varies with GPU clocks, thermals, and background load.
-timeout 30m uv run python train_demo.py --long-test
-
 # Start JupyterLab with an additional temporary dependency.
 uv run --with jupyterlab jupyter lab
 ```
 
 Alternatively, open `demo.ipynb` in VS Code or Cursor and select `.venv/bin/python` as the notebook kernel.
 
-Command-line runs also display and save their output in `benchmark_results/` in the project directory. `check_gpu.py` writes a complete `check_gpu.txt` log and separate files for environment information, Conv2D, Transformer, matmul, memory copy, and GPU memory; `train_demo.py` writes `training.txt` or `long_test.txt` depending on the mode; `computer_vision_demo.py` writes `computer_vision.txt`; `large_model_stress.py` writes `large_model_stress.txt`; `transformers_demo.py` writes `transformers.txt`; `sentence_transformers_demo.py` writes `sentence_transformers.txt`. Each file is overwritten when that test starts again, while results of other tests remain unchanged. Standard output and errors are read independently, so warnings near a section boundary may appear in an adjacent section; consult the complete log for all output. Output is flushed line by line, so an interrupted run may leave partial results. The directory is ignored by Git. Notebook cells do not use this command-line logging.
+By default, benchmark scripts run the CPU first and the ROCm iGPU second on the same workload, then report both measurements and the speedup (including when the CPU is faster). Use `--device cpu` or `--device cuda` to run only one side; `cuda` is PyTorch's device name for ROCm. If ROCm is unavailable, the CPU result is still recorded and the comparison is marked unavailable.
 
-Test 3 trains the GPU for 100 epochs by default (select 20–100 with `--long-test-epochs`). On the tested Radeon 780M, the estimate is about 2.5 minutes, extrapolated from the measured 25-epoch run; actual duration varies with GPU clocks, thermals, and background load. It samples temperature, GPU clock, RAM, and GPU memory several times during each epoch and reports the observed peak temperatures/clock plus epoch speed. Each epoch synchronizes with the GPU, so a completed run confirms all epochs finished. New AMD GPU fault/reset messages are checked in `dmesg`; if kernel-log access is restricted, the test reports that check as unavailable rather than claiming no faults occurred. `timeout` provides a process-level guard against a hung run.
+Some throughput comparisons intentionally use CPU fp32 and iGPU fp16; their reported speedup compares those configured modes, not identical precision. Other demos use fp32 on both devices. **GPU runs have previously caused launch failures and system hangs**; save your work before starting the default comparison. `--device cpu` avoids iGPU execution, and a timeout cannot guarantee recovery from a GPU or driver hang.
 
-`transformers_demo.py` downloads the default `distilgpt2` model from Hugging Face on its first run (internet access is required); later runs use the local model cache. It automatically uses the ROCm GPU when available, or CPU otherwise. Use `--device cpu` or `--device cuda` to select a device explicitly, or `--model MODEL_ID` to test another compatible causal language model.
+`run_all_benchmarks.py` runs every benchmark in CPU-then-iGPU order, then reports individual wins and an overall geometric-mean speedup (each measured comparison has equal weight). It stops if a benchmark fails; `--device cpu` or `--device cuda` runs only one side without an overall comparison.
 
-`sentence_transformers_demo.py` downloads `sentence-transformers/all-MiniLM-L6-v2` on its first run and encodes a small sample corpus in batches before ranking it against a query by semantic similarity. Use `--batch-size`, `--top-k`, `--query`, or `--model` to change the demo parameters.
+Command-line runs display and save output and comparison results in `benchmark_results/`: the main runner writes `all_benchmarks.txt`; `check_gpu.py` writes `check_gpu.txt` plus separate environment, Conv2D, Transformer, matmul, memory-copy, and GPU-memory logs; `train_demo.py` writes `training.txt`; the other scripts write `computer_vision.txt`, `transformers.txt`, `sentence_transformers.txt`, or `resnet18_probe.txt`. Notebook output, including CPU-vs-iGPU comparisons, is saved to `demo_notebook.txt`. Each file is overwritten when that test starts again; interrupted runs may leave partial logs. The directory is ignored by Git.
 
-`computer_vision_demo.py` trains ResNet18 and MobileNetV3-Small from scratch on synthetic class-pattern images, then reports test loss, accuracy, training time, and inference latency. It uses FP32 on both CPU and GPU to avoid the FP16 MIOpen convolution failure observed with the tested `gfx1103` stack. This small smoke test does not download a dataset or pretrained weights; increase `--train-size`, `--test-size`, or `--epochs` for a longer run.
+`transformers_demo.py` downloads the default `distilgpt2` model from Hugging Face on its first run (internet access is required); later runs use the local model cache. It generates on CPU and iGPU by default and reports token throughput. Use `--device cpu` or `--device cuda` to select one device, `--model MODEL_ID` to test another compatible causal language model, or `--seed` to set the generation seed.
 
-`large_model_stress.py` now uses ResNet18 in FP32, defaulting to CPU with batch 4, 256×256 synthetic images, one warm-up step and six seconds of training. For GPU use, explicitly select `--device cuda`. The GPU path reports throughput, PyTorch peak allocated/reserved memory, the maximum **sampled** reduction in global free GPU memory, and whether kernel-log fault checks are available. An optional `--target-gtt-gib 2` requires a sampled reduction of at least 2 GiB and otherwise exits nonzero; the default run does not claim to reach 2–4 GiB. Free-memory readings can include other GPU processes, and measurements between steps miss transient peaks.
+`sentence_transformers_demo.py` downloads `sentence-transformers/all-MiniLM-L6-v2` on its first run and encodes a small sample corpus in batches on CPU and iGPU before ranking it against a query. It reports embedding throughput and semantic-search results. Use `--batch-size`, `--top-k`, `--query`, or `--model` to change the demo parameters.
 
-The previous ResNet50 GPU test caused a MIOpen/HIP launch failure and the system hung; the cause remains unknown. **A smaller ResNet18 workload is not guaranteed safe**, even though a single step previously succeeded. Save your work before opting into GPU use. Memory checks between steps cannot prevent a GPU hang, an out-of-memory condition, or transient peaks during a step; a timeout cannot guarantee recovery.
+`computer_vision_demo.py` trains ResNet18 and MobileNetV3-Small from scratch on identical synthetic data on CPU and iGPU, then reports training-time and inference-latency speedups alongside test loss and accuracy. It uses FP32 on both devices to avoid the FP16 MIOpen convolution failure observed with the tested `gfx1103` stack. This smoke test does not download a dataset or pretrained weights; increase `--train-size`, `--test-size`, or `--epochs` for a longer run.
 
-On the tested Radeon 780M, the largest batch that completed the short ResNet18 GPU run at 256×256 was **36**, using FP32, one warm-up step, and 12 timed steps in 6.31 seconds. The maximum sampled reduction in free GPU memory was 1.97 GiB, and PyTorch peak allocated/reserved memory was 1.18/1.57 GiB; the requested 2 GiB target was not reached, so the script returned a nonzero status. The kernel fault check was unavailable due to restricted `dmesg` access, so absence of GPU faults and long-term stability are not established. Later runs with batch 40 at 256×256 and batch 32 at 512×512 failed with GPU launch errors. These results are observations, not safe operating limits; further GPU stress runs risk another system hang.
-
-`resnet18_probe.py` runs a single FP32 training step with a batch of four 64×64 synthetic images, defaulting to CPU. Its output is saved to `benchmark_results/resnet18_probe.txt`. Use `uv run python resnet18_probe.py` for CPU; `--device cuda` explicitly selects the ROCm GPU and reports PyTorch peak allocated/reserved memory, free GPU memory before and after the step, and available GPU fault messages. This is a small diagnostic, not a 2–4 GiB or long-term stability test. **Even this small GPU workload could hang the system**; save your work before opting in. A timeout cannot guarantee recovery from a GPU or driver hang.
+`resnet18_probe.py` compares one FP32 training step with a batch of four 64×64 synthetic images. It reports the timing speedup and GPU memory/fault information. **Even this small GPU workload could hang the system**; save your work before running the default CPU-then-iGPU comparison. Use `--device cpu` to avoid the iGPU, or `--device cuda` to run only the iGPU. A timeout cannot guarantee recovery from a GPU or driver hang.
 
 ## Example results
 
@@ -96,7 +93,7 @@ The following measurements were recorded on a Radeon 780M (`gfx1103`):
 
 Results depend on power limits, cooling, and background load. On an APU, the GPU can be much faster for large matrix multiplications and convolutions, while small models may see a smaller improvement or run faster on the CPU.
 
-`check_gpu.py` runs **Test 1: Conv2D** and **Test 2: Transformer operations** (scaled dot-product attention, Softmax, and backward pass) on CPU fp32 vs GPU fp16. **Test 3** is the optional long-duration GPU training run above. The transformer test checks output shape, Softmax normalization, and finite nonzero gradients. Its GFLOPS estimate counts attention matrix multiplications in forward and backward; Softmax operations are not included. The interactive notebook contains all three tests.
+`check_gpu.py` runs Conv2D, Transformer operations (scaled dot-product attention, Softmax, and backward pass), matmul, and memory-copy benchmarks on CPU and iGPU. It reports a speedup for every paired measurement. The transformer test checks output shape, Softmax normalization, and finite nonzero gradients; its GFLOPS estimate counts attention matrix multiplications in forward and backward, not Softmax operations. The notebook invokes all benchmark scripts, so it includes these comparisons along with CNN training, computer vision, text generation, sentence embeddings, and the ResNet18 probe.
 
 ## Notes and troubleshooting
 
